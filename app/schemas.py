@@ -515,3 +515,82 @@ class CertificateDailyQuotaOut(BaseModel):
 
 class ErrorBody(BaseModel):
     error: dict
+
+
+# ---------------------------------------------------------------------------
+# 设备校准工单（接收校准委托后追踪最终证书；登记/取消/结清/查询均凭管理密钥）
+# ---------------------------------------------------------------------------
+
+class CalibrationWorkOrderRegisterRequest(BaseModel):
+    """登记设备校准工单：唯一工单号 + 设备标识 + 委托人 + 带时区的计划校准时段。
+
+    管理密钥经 X-Management-Key 头校验（不在 body）。计划校准时段按半开区间
+    [scheduled_from, scheduled_to) 解释（起点须早于终点；区间可位于过去或未来）。
+    work_order_no 为幂等键：同号同内容重试返回原工单（200），同号异内容
+    409 work_order_conflict。登记不预占证书编号、有效期或每日限额。
+    时间一律带时区 ISO 8601，缺时区按 UTC 处理（与证书接口约定一致）。
+    """
+    work_order_no: str = Field(
+        ..., min_length=1, max_length=128,
+        description="工单号（管理员登记，业务唯一幂等键）",
+    )
+    device_id: str = Field(..., min_length=1, max_length=128, description="委托设备标识（须与结清证书的设备标识一致）")
+    client: str = Field(..., min_length=1, max_length=256, description="委托人标识")
+    scheduled_from: datetime = Field(..., description="计划校准时段起点（含），带时区 ISO 8601")
+    scheduled_to: datetime = Field(..., description="计划校准时段终点（不含），带时区 ISO 8601")
+
+
+class CalibrationWorkOrderSettleRequest(BaseModel):
+    """结清工单：提交已签发证书编号（工单号取自 URL 路径）。
+
+    管理密钥经 X-Management-Key 头校验。仅接受：普通证书（CALIBRATION）、
+    设备标识与工单一致、校准时刻落在计划半开区间 [scheduled_from, scheduled_to)
+    内且当前为 ACTIVE、结论 PASS 的证书；一张证书不得结清两个工单。结清后
+    绑定与结清时刻固定；同工单同证书重试返回原结果（200），改绑其他证书或
+    取消已结清工单报冲突。证书编号/有效期/每日限额均不在登记或结清时预占。
+    """
+    cert_no: str = Field(..., min_length=1, max_length=128, description="用于结清本工单的已签发普通证书编号")
+
+
+class BoundCertificateSummary(BaseModel):
+    """工单绑定证书的摘要：结清时绑定固定，状态/撤销字段随查询时刻反映当前值。
+
+    证书日后被撤销（REVOKED）或级联失效（INVALID）不倒退工单状态，查询工单
+    时本摘要返回该绑定证书的当前状态；其余签发字段为原始内容，不随状态变化。
+    """
+    cert_no: str
+    kind: CertKind
+    device_id: str
+    device_name: str | None = None
+    calibrated_at: datetime
+    valid_from: datetime
+    valid_to: datetime
+    conclusion: CertConclusion
+    parent_cert_no: str | None = None
+    operator: str | None = None
+    status: CertStatus
+    revoked_reason: str | None = None
+    revoked_at: datetime | None = None
+
+
+class CalibrationWorkOrderOut(BaseModel):
+    """设备校准工单视图。
+
+    status=PENDING：cancelled_at/cert_no/settled_at/certificate 均为空；
+    status=CANCELLED：仅 cancelled_at 非空，不绑定证书；
+    status=SETTLED：cert_no/settled_at 与 certificate 非空（绑定与结清时刻固定），
+                    certificate.status 反映绑定证书【当前】状态（撤销/失效不倒退工单）。
+    """
+    work_order_no: str
+    status: Literal["PENDING", "CANCELLED", "SETTLED"]
+    device_id: str
+    client: str
+    scheduled_from: datetime
+    scheduled_to: datetime
+    created_at: datetime
+    cancelled_at: datetime | None = None
+    cert_no: str | None = None
+    settled_at: datetime | None = None
+    certificate: BoundCertificateSummary | None = Field(
+        None, description="结清绑定的证书摘要（含当前状态）；未结清为 null",
+    )

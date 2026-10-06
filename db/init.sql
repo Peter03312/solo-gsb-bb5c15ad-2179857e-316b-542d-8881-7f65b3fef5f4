@@ -300,6 +300,63 @@ CREATE INDEX idx_cert_quota_usage
     ON certificates (parent_cert_no, ((calibrated_at AT TIME ZONE 'UTC')::date));
 
 -- ----------------------------------------------------------------------------
+-- 设备校准工单表：计量机构接收设备校准委托后，管理员凭本地管理密钥登记唯一
+-- 工单号、设备标识、委托人与带时区的计划校准时段（半开区间
+-- [scheduled_from, scheduled_to)），用工单追踪最终证书；取消、结清与查询均
+-- 须同一把管理密钥。
+--
+-- 生命周期：PENDING（待完成，初始） -> CANCELLED（取消，仅 PENDING 可取消）
+--                              PENDING -> SETTLED（结清，绑定一张合格普通证书）
+-- 登记内容（编号/设备/委托人/计划时段/请求指纹/创建时刻）一经写入不可改写，
+-- 行不可删除（触发器强制）；status 只允许上述一次性推进。
+--
+-- 结清不预占证书：登记阶段不触碰 certificates，不预占证书编号、有效期或每日
+-- 限额。结清在同一事务内对工单行与证书行加锁，按“结清当时”的证书状态判定：
+-- 普通证书（CALIBRATION）、设备标识与工单一致、校准时刻落在计划半开区间内、
+-- 当前 ACTIVE 且结论 PASS。一张证书至多结清一个工单——部分唯一索引对已结清
+-- 行兜底，并发结清由数据库保证不产生重复绑定。结清后绑定（cert_no）与结清
+-- 时刻（settled_at）固定；证书日后被撤销/级联失效不倒退工单状态，查询时
+-- 绑定证书返回其当前状态（在视图中实时关联 v_certificates）。
+-- ----------------------------------------------------------------------------
+CREATE TABLE calibration_work_orders (
+    work_order_no  TEXT PRIMARY KEY,                 -- 工单号（管理员登记，业务唯一幂等键）
+    request_hash   TEXT NOT NULL,                    -- 规范化登记请求的 SHA-256 指纹
+    request        JSONB NOT NULL,                   -- 规范化登记请求快照（同号同内容判定）
+    device_id      TEXT NOT NULL,                   -- 委托设备标识（须与结清证书一致）
+    client         TEXT NOT NULL,                   -- 委托人标识
+    scheduled_from TIMESTAMPTZ NOT NULL,             -- 计划校准时段起点（含）
+    scheduled_to   TIMESTAMPTZ NOT NULL,             -- 计划校准时段终点（不含）
+    status         TEXT NOT NULL DEFAULT 'PENDING'
+                     CHECK (status IN ('PENDING', 'CANCELLED', 'SETTLED')),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(), -- 登记时刻
+    cancelled_at   TIMESTAMPTZ,                      -- 取消时刻（仅 CANCELLED）
+    cert_no        TEXT REFERENCES certificates(cert_no), -- 结清绑定的普通证书（仅 SETTLED）
+    settled_at     TIMESTAMPTZ,                      -- 结清时刻（仅 SETTLED，与绑定一同固定）
+    CHECK (scheduled_from < scheduled_to)
+);
+
+-- 状态与定稿字段的完整性：
+-- * PENDING   尚无取消/结清的任何定稿字段；
+-- * CANCELLED 仅写入取消时刻，不绑定证书；
+-- * SETTLED   必须绑定证书与结清时刻，且无取消时刻。
+ALTER TABLE calibration_work_orders ADD CONSTRAINT cal_work_order_status_metadata
+    CHECK (
+        (status = 'PENDING'
+             AND cancelled_at IS NULL AND cert_no IS NULL AND settled_at IS NULL)
+        OR (status = 'CANCELLED'
+             AND cancelled_at IS NOT NULL AND cert_no IS NULL AND settled_at IS NULL)
+        OR (status = 'SETTLED'
+             AND cancelled_at IS NULL AND cert_no IS NOT NULL AND settled_at IS NOT NULL)
+    );
+
+CREATE INDEX idx_cal_work_orders_device ON calibration_work_orders(device_id);
+
+-- 一张证书不得结清两个工单：仅已结清行参与唯一索引；并发结清同一证书时由
+-- 数据库兜底（后到事务在唯一索引上等待，先提交者胜出，其余报唯一冲突）。
+CREATE UNIQUE INDEX idx_cal_work_order_cert_once
+    ON calibration_work_orders(cert_no) WHERE (status = 'SETTLED');
+
+-- ----------------------------------------------------------------------------
 -- 触发器 1：证书签发内容不可改写
 -- 仅允许 status / revoked_reason / revoked_at 在撤销事务中变化；
 -- 其余业务字段（编号、设备、时间、结论、引用关系等）一律拒绝 UPDATE。
@@ -478,6 +535,37 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER trg_cert_review_decide_once
     BEFORE UPDATE OR DELETE ON certificate_review_requests
     FOR EACH ROW EXECUTE FUNCTION cert_review_decide_once();
+
+-- 校准工单仅允许“PENDING -> CANCELLED/SETTLED”这一次性定稿 UPDATE：
+-- 登记内容（工单号/请求指纹与快照/设备/委托人/计划时段/登记时刻）不可改，
+-- 已取消不能再结清/再取消、已结清不能改绑或取消；DELETE 禁止。
+CREATE OR REPLACE FUNCTION cal_work_orders_decide_once() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'calibration_work_orders is append-only: %', OLD.work_order_no
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF OLD.status <> 'PENDING' OR NEW.status NOT IN ('CANCELLED', 'SETTLED')
+       OR NEW.work_order_no  IS DISTINCT FROM OLD.work_order_no
+       OR NEW.request_hash   IS DISTINCT FROM OLD.request_hash
+       OR NEW.request        IS DISTINCT FROM OLD.request
+       OR NEW.device_id      IS DISTINCT FROM OLD.device_id
+       OR NEW.client         IS DISTINCT FROM OLD.client
+       OR NEW.scheduled_from IS DISTINCT FROM OLD.scheduled_from
+       OR NEW.scheduled_to   IS DISTINCT FROM OLD.scheduled_to
+       OR NEW.created_at     IS DISTINCT FROM OLD.created_at
+    THEN
+        RAISE EXCEPTION 'work order % can only be decided once (% -> %)',
+            OLD.work_order_no, OLD.status, NEW.status
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_cal_work_orders_decide_once
+    BEFORE UPDATE OR DELETE ON calibration_work_orders
+    FOR EACH ROW EXECUTE FUNCTION cal_work_orders_decide_once();
 
 -- ----------------------------------------------------------------------------
 -- 查询视图：统一将枚举以文本形式暴露给应用层

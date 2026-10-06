@@ -62,8 +62,16 @@ app = FastAPI(
         "（批内多张相同键合并计数）与双人复核批准均在真正签发时原子扣额，超限"
         "拒绝并指出上游证书与日期，批次整批不落库、复核申请保持待审；并发调整与"
         "签发按提交次序串行绝不超额，批次幂等重放只返回首次结果、不重复计数。"
+        "支持设备校准工单：管理员凭管理密钥登记唯一工单号、设备标识、委托人与"
+        "带时区的计划校准半开时段（工单号幂等：同号同内容返回原工单、同号异内容"
+        "拒绝），取消/结清/查询均须该密钥；工单初始待完成且仅此状态可取消。"
+        "结清提交工单号与已签发证书编号，仅接受设备一致、校准时刻落在计划时段内"
+        "且当前 ACTIVE、PASS 的普通证书，一张证书不得结清两个工单；结清后绑定与"
+        "结清时刻固定（同工单同证书重试返回原结果，改绑或取消冲突），不预占证书"
+        "编号/有效期/每日限额，证书日后撤销或失效不倒退工单状态，查询返回绑定"
+        "证书的当前状态；并发结清/取消/撤销不产生重复绑定或无效结清。",
     ),
-    version="1.10.0",
+    version="1.11.0",
     lifespan=lifespan,
 )
 
@@ -114,6 +122,10 @@ def index():
             "GET  /api/v1/certificates/{cert_no}/chain",
             "GET  /api/v1/certificates/{cert_no}/downstream",
             "POST /api/v1/certificates/{cert_no}/revoke",
+            "POST /api/v1/calibration-work-orders",
+            "POST /api/v1/calibration-work-orders/{work_order_no}/cancel",
+            "POST /api/v1/calibration-work-orders/{work_order_no}/settle",
+            "GET  /api/v1/calibration-work-orders/{work_order_no}",
             "POST /api/v1/correction-declarations",
             "GET  /api/v1/correction-declarations/{declaration_no}",
             "GET  /api/v1/certificates/{cert_no}/corrections",

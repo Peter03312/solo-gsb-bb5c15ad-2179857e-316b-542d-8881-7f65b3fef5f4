@@ -15,6 +15,10 @@
 - GET    /api/v1/certificates/{cert_no}/chain  完整追溯引用链
 - GET    /api/v1/certificates/{cert_no}/downstream  全部下游证书（影响面预览）
 - POST   /api/v1/certificates/{cert_no}/revoke 撤销证书并级联失效下游
+- POST   /api/v1/calibration-work-orders                      管理员登记设备校准工单（管理密钥，工单号幂等）
+- POST   /api/v1/calibration-work-orders/{work_order_no}/cancel  取消待完成工单（管理密钥；仅 PENDING 可取消）
+- POST   /api/v1/calibration-work-orders/{work_order_no}/settle  按工单号+证书编号结清（管理密钥；ACTIVE/PASS 普通证书、设备一致、校准时刻落在计划半开区间内）
+- GET    /api/v1/calibration-work-orders/{work_order_no}      按工单号查询（管理密钥；返回绑定证书当前状态）
 - POST   /api/v1/correction-declarations       登记更正声明（展示字段纠错，声明编号幂等）
 - GET    /api/v1/correction-declarations/{declaration_no}  按声明编号查询
 - GET    /api/v1/certificates/{cert_no}/corrections  证书更正视图（声明历史+合并展示）
@@ -43,6 +47,9 @@ from psycopg_pool import ConnectionPool
 from . import repository as repo
 from .schemas import (
     BatchIssueRequest,
+    CalibrationWorkOrderOut,
+    CalibrationWorkOrderRegisterRequest,
+    CalibrationWorkOrderSettleRequest,
     CertificateDailyQuotaOut,
     CertificateDailyQuotaRequest,
     CertificateIssueRequest,
@@ -515,3 +522,122 @@ def get_revocation_archive_impact(
     （含级联失效）的归档包及包内目标证书，按 (归档包编号, 原交付序位) 分页。"""
     with pool.connection() as conn:
         return repo.get_revocation_archive_impact(conn, batch_id, limit, offset)
+
+
+# ---------------------------------------------------------------------------
+# 设备校准工单（接收校准委托后追踪最终证书；登记/取消/结清/查询均凭管理密钥）
+# ---------------------------------------------------------------------------
+
+@router.post("/calibration-work-orders", status_code=201, response_model=CalibrationWorkOrderOut)
+def register_calibration_work_order(
+    req: CalibrationWorkOrderRegisterRequest,
+    response: Response,
+    x_management_key: str | None = Header(
+        default=None,
+        alias="X-Management-Key",
+        description="本地配置的管理密钥（与交付/停用/每日限额共用）",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """管理员登记设备校准工单：唯一工单号、设备标识、委托人与带时区的计划校准
+    时段（半开区间 [scheduled_from, scheduled_to)）。
+
+    工单初始为 PENDING（待完成）。登记不预占证书编号、有效期或每日限额，
+    既有单张/批次/双人复核签发规则照常执行。工单号为幂等键：同号同内容重试
+    返回原工单（200，状态随原工单），同号异内容 409 work_order_conflict。
+    管理密钥缺失/错误 401；计划时段起点不早于终点 422 invalid_schedule_window。
+    """
+    with pool.connection() as conn:
+        body, created = repo.register_calibration_work_order(conn, req, x_management_key)
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.post(
+    "/calibration-work-orders/{work_order_no}/cancel",
+    status_code=201,
+    response_model=CalibrationWorkOrderOut,
+)
+def cancel_calibration_work_order(
+    work_order_no: str,
+    response: Response,
+    x_management_key: str | None = Header(
+        default=None,
+        alias="X-Management-Key",
+        description="本地配置的管理密钥（与交付/停用/每日限额共用）",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """取消待完成工单（无请求体）：仅 PENDING 可取消。
+
+    首次取消 201；对已取消工单重复取消返回首次结果（200）；已结清工单取消
+    409 work_order_already_settled。管理密钥缺失/错误 401；工单不存在
+    404 work_order_not_found。并发取消与结清按提交次序恰一个定稿。
+    """
+    with pool.connection() as conn:
+        body, created = repo.cancel_calibration_work_order(conn, work_order_no, x_management_key)
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.post(
+    "/calibration-work-orders/{work_order_no}/settle",
+    status_code=201,
+    response_model=CalibrationWorkOrderOut,
+)
+def settle_calibration_work_order(
+    work_order_no: str,
+    req: CalibrationWorkOrderSettleRequest,
+    response: Response,
+    x_management_key: str | None = Header(
+        default=None,
+        alias="X-Management-Key",
+        description="本地配置的管理密钥（与交付/停用/每日限额共用）",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """提交工单号与已签发证书编号结清工单。
+
+    仅接受设备标识与工单一致、校准时刻落在计划半开区间内且当前为 ACTIVE、
+    PASS 的普通（CALIBRATION）证书；一张证书不得结清两个工单。结清后绑定与
+    结清时刻固定：同工单同证书重试返回原结果（200，证书状态取当前），改绑
+    其他证书 409 work_order_rebind_conflict，取消已结清工单
+    409 work_order_already_settled，已取消工单结清 409 work_order_cancelled，
+    证书已结清其他工单 409 cert_already_settled。证书日后撤销/失效不倒退
+    工单状态。管理密钥缺失/错误 401；工单/证书缺失分别 404 work_order_not_found
+    /cert_not_found；设备不一致、超计划时段、非 ACTIVE、非 PASS、基准证书
+    分别 422 settle_device_mismatch / settle_out_of_schedule /
+    settle_cert_not_active / settle_cert_not_passed / settle_cert_not_calibration。
+    """
+    with pool.connection() as conn:
+        body, created = repo.settle_calibration_work_order(
+            conn, work_order_no, req.cert_no, x_management_key
+        )
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.get(
+    "/calibration-work-orders/{work_order_no}",
+    response_model=CalibrationWorkOrderOut,
+)
+def get_calibration_work_order(
+    work_order_no: str,
+    x_management_key: str | None = Header(
+        default=None,
+        alias="X-Management-Key",
+        description="本地配置的管理密钥（与交付/停用/每日限额共用）",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """凭管理密钥按工单号查询：登记内容、状态与定稿时刻，以及绑定证书摘要。
+
+    已结清工单的 certificate.status 为绑定证书的【当前】状态——证书日后被
+    撤销/级联失效不改变工单状态（仍 SETTLED、绑定与结清时刻不变）。
+    管理密钥缺失/错误 401；工单不存在 404 work_order_not_found。
+    """
+    with pool.connection() as conn:
+        return repo.get_calibration_work_order(conn, work_order_no, x_management_key)

@@ -146,6 +146,38 @@ CREATE INDEX IF NOT EXISTS idx_cert_quota_usage
     ON certificates (parent_cert_no, ((calibrated_at AT TIME ZONE 'UTC')::date));
 """,
     """
+CREATE TABLE IF NOT EXISTS calibration_work_orders (
+    work_order_no  TEXT PRIMARY KEY,
+    request_hash   TEXT NOT NULL,
+    request        JSONB NOT NULL,
+    device_id      TEXT NOT NULL,
+    client         TEXT NOT NULL,
+    scheduled_from TIMESTAMPTZ NOT NULL,
+    scheduled_to   TIMESTAMPTZ NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'PENDING'
+                     CHECK (status IN ('PENDING', 'CANCELLED', 'SETTLED')),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    cancelled_at   TIMESTAMPTZ,
+    cert_no        TEXT REFERENCES certificates(cert_no),
+    settled_at     TIMESTAMPTZ,
+    CHECK (scheduled_from < scheduled_to)
+);
+ALTER TABLE calibration_work_orders DROP CONSTRAINT IF EXISTS cal_work_order_status_metadata;
+ALTER TABLE calibration_work_orders ADD CONSTRAINT cal_work_order_status_metadata
+    CHECK (
+        (status = 'PENDING'
+             AND cancelled_at IS NULL AND cert_no IS NULL AND settled_at IS NULL)
+        OR (status = 'CANCELLED'
+             AND cancelled_at IS NOT NULL AND cert_no IS NULL AND settled_at IS NULL)
+        OR (status = 'SETTLED'
+             AND cancelled_at IS NULL AND cert_no IS NOT NULL AND settled_at IS NOT NULL)
+    );
+CREATE INDEX IF NOT EXISTS idx_cal_work_orders_device
+    ON calibration_work_orders(device_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cal_work_order_cert_once
+    ON calibration_work_orders(cert_no) WHERE (status = 'SETTLED');
+""",
+    """
 CREATE OR REPLACE FUNCTION cert_review_decide_once() RETURNS trigger AS $$
 BEGIN
     IF TG_OP = 'DELETE' THEN
@@ -172,6 +204,36 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE TRIGGER trg_cert_review_decide_once
     BEFORE UPDATE OR DELETE ON certificate_review_requests
     FOR EACH ROW EXECUTE FUNCTION cert_review_decide_once();
+""",
+    """
+CREATE OR REPLACE FUNCTION cal_work_orders_decide_once() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'calibration_work_orders is append-only: %', OLD.work_order_no
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF OLD.status <> 'PENDING' OR NEW.status NOT IN ('CANCELLED', 'SETTLED')
+       OR NEW.work_order_no  IS DISTINCT FROM OLD.work_order_no
+       OR NEW.request_hash   IS DISTINCT FROM OLD.request_hash
+       OR NEW.request        IS DISTINCT FROM OLD.request
+       OR NEW.device_id      IS DISTINCT FROM OLD.device_id
+       OR NEW.client         IS DISTINCT FROM OLD.client
+       OR NEW.scheduled_from IS DISTINCT FROM OLD.scheduled_from
+       OR NEW.scheduled_to   IS DISTINCT FROM OLD.scheduled_to
+       OR NEW.created_at     IS DISTINCT FROM OLD.created_at
+    THEN
+        RAISE EXCEPTION 'work order % can only be decided once (% -> %)',
+            OLD.work_order_no, OLD.status, NEW.status
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_cal_work_orders_decide_once
+    BEFORE UPDATE OR DELETE ON calibration_work_orders
+    FOR EACH ROW EXECUTE FUNCTION cal_work_orders_decide_once();
 """,
     """
 CREATE OR REPLACE FUNCTION cert_suspensions_lift_only() RETURNS trigger AS $$
