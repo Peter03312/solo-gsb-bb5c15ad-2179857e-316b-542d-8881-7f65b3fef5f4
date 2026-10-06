@@ -146,6 +146,35 @@ CREATE INDEX IF NOT EXISTS idx_cert_quota_usage
     ON certificates (parent_cert_no, ((calibrated_at AT TIME ZONE 'UTC')::date));
 """,
     """
+CREATE TABLE IF NOT EXISTS calibration_work_orders (
+    work_order_no  TEXT PRIMARY KEY,
+    device_id      TEXT NOT NULL,
+    client         TEXT NOT NULL,
+    scheduled_from TIMESTAMPTZ NOT NULL,
+    scheduled_to   TIMESTAMPTZ NOT NULL,
+    request_hash   TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'PENDING'
+                     CHECK (status IN ('PENDING', 'SETTLED', 'CANCELLED')),
+    cert_no        TEXT REFERENCES certificates(cert_no),
+    settled_at     TIMESTAMPTZ,
+    cancelled_at   TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT work_order_window_order CHECK (scheduled_from < scheduled_to),
+    CONSTRAINT work_order_status_metadata
+        CHECK (
+            (status = 'PENDING'
+                 AND cert_no IS NULL AND settled_at IS NULL AND cancelled_at IS NULL)
+            OR (status = 'SETTLED'
+                 AND cert_no IS NOT NULL AND settled_at IS NOT NULL AND cancelled_at IS NULL)
+            OR (status = 'CANCELLED'
+                 AND cert_no IS NULL AND settled_at IS NULL AND cancelled_at IS NOT NULL)
+        )
+);
+CREATE INDEX IF NOT EXISTS idx_work_orders_device ON calibration_work_orders(device_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_work_orders_one_per_cert
+    ON calibration_work_orders(cert_no) WHERE (status = 'SETTLED');
+""",
+    """
 CREATE OR REPLACE FUNCTION cert_review_decide_once() RETURNS trigger AS $$
 BEGIN
     IF TG_OP = 'DELETE' THEN
@@ -275,6 +304,35 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE TRIGGER trg_delivery_revocation_notices_confirm_once
     BEFORE UPDATE OR DELETE ON delivery_revocation_notices
     FOR EACH ROW EXECUTE FUNCTION delivery_revocation_notices_confirm_once();
+""",
+    """
+CREATE OR REPLACE FUNCTION work_order_transition_once() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'calibration_work_orders is append-only: %', OLD.work_order_no
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF OLD.status <> 'PENDING' OR NEW.status NOT IN ('SETTLED', 'CANCELLED')
+       OR NEW.work_order_no  IS DISTINCT FROM OLD.work_order_no
+       OR NEW.device_id      IS DISTINCT FROM OLD.device_id
+       OR NEW.client         IS DISTINCT FROM OLD.client
+       OR NEW.scheduled_from IS DISTINCT FROM OLD.scheduled_from
+       OR NEW.scheduled_to   IS DISTINCT FROM OLD.scheduled_to
+       OR NEW.request_hash   IS DISTINCT FROM OLD.request_hash
+       OR NEW.created_at     IS DISTINCT FROM OLD.created_at
+    THEN
+        RAISE EXCEPTION 'work order % can only transition once (% -> %)',
+            OLD.work_order_no, OLD.status, NEW.status
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_work_order_transition_once
+    BEFORE UPDATE OR DELETE ON calibration_work_orders
+    FOR EACH ROW EXECUTE FUNCTION work_order_transition_once();
 """,
 )
 

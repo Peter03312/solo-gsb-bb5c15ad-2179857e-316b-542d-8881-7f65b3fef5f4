@@ -61,9 +61,16 @@ app = FastAPI(
         "直接引用的上游证书计一次，未配置上限沿用原签发规则；单张签发、交接批次"
         "（批内多张相同键合并计数）与双人复核批准均在真正签发时原子扣额，超限"
         "拒绝并指出上游证书与日期，批次整批不落库、复核申请保持待审；并发调整与"
-        "签发按提交次序串行绝不超额，批次幂等重放只返回首次结果、不重复计数。"
+        "签发按提交次序串行绝不超额，批次幂等重放只返回首次结果、不重复计数；"
+        "支持设备校准委托工单：管理员凭管理密钥登记唯一工单号、设备标识、委托人"
+        "与带时区的计划校准半开区间（同号同内容重试返回原工单、同号异内容拒绝），"
+        "可取消待完成工单、按工单号查询；结清时提交已签发证书编号，仅接受设备"
+        "一致、校准时刻落在计划时段内且当前 ACTIVE、PASS 的普通证书，一张证书不"
+        "得结清两个工单；结清后绑定与结清时刻固定（同工单同证书重试返回原结果，"
+        "改绑或取消冲突），不预占证书编号、有效期或每日限额，既有签发规则照常；"
+        "证书日后撤销或失效不倒退工单状态，查询返回绑定证书的当前状态。"
     ),
-    version="1.10.0",
+    version="1.11.0",
     lifespan=lifespan,
 )
 
@@ -104,6 +111,10 @@ def index():
             "POST /api/v1/certificates",
             "PUT  /api/v1/certificates/{cert_no}/daily-quotas/{day}",
             "GET  /api/v1/certificates/{cert_no}/daily-quotas/{day}",
+            "POST /api/v1/work-orders",
+            "POST /api/v1/work-orders/{work_order_no}/settle",
+            "POST /api/v1/work-orders/{work_order_no}/cancel",
+            "GET  /api/v1/work-orders/{work_order_no}",
             "POST /api/v1/certificate-review-requests",
             "POST /api/v1/certificate-review-requests/{application_no}/decision",
             "GET  /api/v1/certificate-review-requests/{application_no}",

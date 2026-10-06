@@ -513,5 +513,78 @@ class CertificateDailyQuotaOut(BaseModel):
     updated_at: datetime = Field(..., description="最近一次调整时刻")
 
 
+class WorkOrderRegisterRequest(BaseModel):
+    """登记设备校准委托工单（管理密钥经 X-Management-Key 头校验，不在 body）。
+
+    以唯一工单号登记设备标识、委托人与带时区的计划校准时段（半开区间
+    [scheduled_from, scheduled_to)）；登记只保存委托信息，不预占证书编号、
+    有效期或每日限额。work_order_no 为幂等键：同号同内容重试返回原工单
+    （200），同号异内容返回 409 work_order_conflict。
+    """
+    work_order_no: str = Field(
+        ..., min_length=1, max_length=128,
+        description="唯一工单号（幂等键，业务唯一）",
+    )
+    device_id: str = Field(..., min_length=1, max_length=128, description="委托设备标识")
+    client: str = Field(..., min_length=1, max_length=256, description="委托人（委托单位/联系人）")
+    scheduled_from: datetime = Field(..., description="计划校准时段起点（含），带时区 ISO 8601")
+    scheduled_to: datetime = Field(..., description="计划校准时段终点（不含），带时区 ISO 8601")
+
+    @model_validator(mode="after")
+    def _normalize(self):
+        self.work_order_no = self.work_order_no.strip()
+        self.device_id = self.device_id.strip()
+        self.client = self.client.strip()
+        if not self.work_order_no or not self.device_id or not self.client:
+            raise ValueError("工单号、设备标识与委托人均不得为空白")
+        if self.scheduled_from >= self.scheduled_to:
+            raise ValueError("scheduled_from 必须早于 scheduled_to（计划时段按半开区间 [from, to) 判定）")
+        return self
+
+
+class WorkOrderSettleRequest(BaseModel):
+    """结清工单：提交已签发证书编号（管理密钥经 X-Management-Key 头校验）。
+
+    仅接受与工单设备标识一致、校准时刻落在计划半开区间内、当前 ACTIVE 且
+    结论 PASS 的普通（CALIBRATION）证书；一张证书不得结清两个工单。同工单
+    同证书重试返回首次结清结果（200）；改绑其他证书或工单已取消均报冲突。
+    工单号取自 URL 路径，不放在 body 中。
+    """
+    cert_no: str = Field(
+        ..., min_length=1, max_length=128,
+        description="用于结清工单的已签发普通校准证书编号",
+    )
+
+    @model_validator(mode="after")
+    def _normalize(self):
+        self.cert_no = self.cert_no.strip()
+        if not self.cert_no:
+            raise ValueError("cert_no 不得为空白")
+        return self
+
+
+class WorkOrderOut(BaseModel):
+    """工单视图：登记信息、状态，以及结清时绑定的证书（查询时实时状态）。"""
+    work_order_no: str
+    status: Literal["PENDING", "SETTLED", "CANCELLED"] = Field(
+        ..., description="PENDING 待完成；SETTLED 已结清；CANCELLED 已取消（仅 PENDING 可取消）"
+    )
+    device_id: str
+    client: str
+    scheduled_from: datetime
+    scheduled_to: datetime
+    created_at: datetime = Field(..., description="登记时刻")
+    cert_no: str | None = Field(None, description="结清绑定的证书编号；未结清为 null")
+    settled_at: datetime | None = Field(
+        None, description="结清时刻（绑定后固定，不因证书事后撤销/失效改写）"
+    )
+    cancelled_at: datetime | None = Field(None, description="取消时刻")
+    certificate: CertificateOut | None = Field(
+        None,
+        description="结清绑定证书的【当前】内容（含当前状态 ACTIVE/REVOKED/INVALID）；"
+        "未结清为 null。证书日后撤销或失效不倒退工单状态，此处实时反映",
+    )
+
+
 class ErrorBody(BaseModel):
     error: dict

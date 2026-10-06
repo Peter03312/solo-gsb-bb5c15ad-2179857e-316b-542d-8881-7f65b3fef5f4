@@ -2896,3 +2896,325 @@ def get_certificate_review(conn, application_no: str, provided_key: str | None) 
             404, "review_request_not_found", f"复核申请不存在: {application_no}"
         )
     return _review_view(row)
+
+
+# ---------------------------------------------------------------------------
+# 设备校准委托工单：管理员凭管理密钥登记唯一工单号、设备标识、委托人与带
+# 时区的计划校准时段（半开区间），并取消/结清/查询。登记不预占证书编号、
+# 有效期或每日限额；结清只接受设备一致、校准时刻落在计划时段内、当前
+# ACTIVE 且 PASS 的普通证书，一张证书至多结清一个工单（部分唯一索引兜底）。
+# 结清绑定固定（同工单同证书重放首次结果，改绑/取消冲突）；证书日后撤销/
+# 失效不倒退工单状态，查询实时返回证书当前状态。
+# ---------------------------------------------------------------------------
+
+_WORK_ORDER_COLS = (
+    "work_order_no, device_id, client, scheduled_from, scheduled_to, "
+    "request_hash, status, cert_no, settled_at, cancelled_at, created_at"
+)
+
+
+def _get_work_order_row(conn, work_order_no: str, lock: bool = False) -> dict | None:
+    sql = f"SELECT {_WORK_ORDER_COLS} FROM calibration_work_orders WHERE work_order_no = %s"
+    if lock:
+        sql += " FOR UPDATE"
+    return conn.execute(sql, (work_order_no,)).fetchone()
+
+
+def _work_order_view(conn, row: dict) -> dict:
+    """工单行 -> API 视图；结清时嵌入绑定证书的【当前】内容（实时状态）。"""
+    body = {
+        "work_order_no": row["work_order_no"],
+        "status": row["status"],
+        "device_id": row["device_id"],
+        "client": row["client"],
+        "scheduled_from": row["scheduled_from"],
+        "scheduled_to": row["scheduled_to"],
+        "created_at": row["created_at"],
+        "cert_no": row["cert_no"],
+        "settled_at": row["settled_at"],
+        "cancelled_at": row["cancelled_at"],
+        "certificate": None,
+    }
+    if row["cert_no"] is not None:
+        # 绑定不可解除，但证书行仅可被撤销（不删除），因此总能读到当前内容
+        body["certificate"] = _get_cert_row(conn, row["cert_no"])
+    return body
+
+
+def register_work_order(conn, req, management_key: str | None) -> tuple[dict, bool]:
+    """登记设备校准委托工单，返回 (工单视图, 是否首次登记)。
+
+    - 管理密钥缺失/错误 401 invalid_management_key（先于一切业务校验）；
+    - 计划时段非半开有效区间 422（Pydantic 层 invalid_*）；
+    - 工单号幂等：同号同内容重试返回原工单（200），同号异内容
+      409 work_order_conflict；并发同号由主键兜底。
+    """
+    _require_management_key(management_key)
+    req_hash, request_doc = _canonical_request(req)
+    scheduled_from = _as_utc(req.scheduled_from)
+    scheduled_to = _as_utc(req.scheduled_to)
+    try:
+        with conn.transaction():
+            existing = _get_work_order_row(conn, req.work_order_no)
+            if existing is not None:
+                if existing["request_hash"] != req_hash:
+                    raise ApiError(
+                        409,
+                        "work_order_conflict",
+                        f"工单号 {req.work_order_no} 已用于一份内容不同的委托工单；"
+                        "同一工单号只允许重放完全相同的登记请求",
+                        details={"work_order_no": req.work_order_no},
+                    )
+                return _work_order_view(conn, existing), False
+            conn.execute(
+                """
+                INSERT INTO calibration_work_orders
+                    (work_order_no, device_id, client, scheduled_from, scheduled_to,
+                     request_hash, status)
+                VALUES (%s, %s, %s, %s, %s, %s, 'PENDING')
+                """,
+                (
+                    req.work_order_no, req.device_id, req.client,
+                    scheduled_from, scheduled_to, req_hash,
+                ),
+            )
+            row = _get_work_order_row(conn, req.work_order_no)
+        return _work_order_view(conn, row), True
+    except psycopg.errors.UniqueViolation:
+        # 并发同号登记：主键兜底，后到事务回滚后按已提交工单重放/判冲突
+        existing = _get_work_order_row(conn, req.work_order_no)
+        if existing is None:
+            raise
+        if existing["request_hash"] != req_hash:
+            raise ApiError(
+                409,
+                "work_order_conflict",
+                f"工单号 {req.work_order_no} 已用于一份内容不同的委托工单（并发登记）",
+                details={"work_order_no": req.work_order_no},
+            )
+        return _work_order_view(conn, existing), False
+
+
+def _settle_work_order_once(conn, work_order_no: str, cert_no: str, now: datetime) -> tuple[dict, bool]:
+    """单次结清事务，返回 (工单视图, 是否首次结清)。
+
+    先锁工单行（串行化同工单的并发结清/取消），再锁证书行（与并发撤销
+    按提交次序串行），并在证书行锁内完成全部结清资格校验，保证不会把
+    撤销/失效中的证书绑定进来。
+    """
+    with conn.transaction():
+        order = _get_work_order_row(conn, work_order_no, lock=True)
+        if order is None:
+            raise ApiError(404, "work_order_not_found", f"工单不存在: {work_order_no}")
+        if order["status"] == "SETTLED":
+            # 同工单同证书重试返回首次结果；改绑其他证书报冲突。
+            if order["cert_no"] == cert_no:
+                return _work_order_view(conn, order), False
+            raise ApiError(
+                409,
+                "work_order_cert_rebind_conflict",
+                f"工单 {work_order_no} 已绑定证书 {order['cert_no']} 并结清："
+                "结清绑定固定，不得改绑其他证书；同工单同证书重试返回首次结果",
+                details={
+                    "work_order_no": work_order_no,
+                    "bound_cert_no": order["cert_no"],
+                    "request_cert_no": cert_no,
+                },
+            )
+        if order["status"] == "CANCELLED":
+            raise ApiError(
+                409,
+                "work_order_not_pending",
+                f"工单 {work_order_no} 已取消（{order['cancelled_at'].isoformat()}），"
+                "已取消工单不得结清（只有待完成工单可结清）",
+                details={
+                    "work_order_no": work_order_no,
+                    "status": "CANCELLED",
+                    "cancelled_at": order["cancelled_at"].isoformat(),
+                },
+            )
+
+        cert = _get_cert_row(conn, cert_no, lock=True)
+        if cert is None:
+            raise ApiError(404, "cert_not_found", f"证书不存在: {cert_no}")
+        if cert["kind"] != "CALIBRATION":
+            raise ApiError(
+                422,
+                "settlement_cert_not_calibration",
+                f"证书 {cert_no} 为基准证书（REFERENCE），工单只接受普通校准证书结清",
+                details={"work_order_no": work_order_no, "cert_no": cert_no, "kind": cert["kind"]},
+            )
+        if cert["device_id"] != order["device_id"]:
+            raise ApiError(
+                422,
+                "settlement_device_mismatch",
+                f"证书 {cert_no} 的设备标识 {cert['device_id']} 与工单 {work_order_no} "
+                f"登记的设备标识 {order['device_id']} 不一致，不得用于结清",
+                details={
+                    "work_order_no": work_order_no,
+                    "cert_no": cert_no,
+                    "work_order_device_id": order["device_id"],
+                    "cert_device_id": cert["device_id"],
+                },
+            )
+        scheduled_from = _as_utc(order["scheduled_from"])
+        scheduled_to = _as_utc(order["scheduled_to"])
+        calibrated_at = _as_utc(cert["calibrated_at"])
+        if not (scheduled_from <= calibrated_at < scheduled_to):
+            raise ApiError(
+                422,
+                "settlement_outside_schedule",
+                f"证书 {cert_no} 的校准时刻 {calibrated_at.isoformat()} 不在工单 "
+                f"{work_order_no} 的计划校准时段 "
+                f"[{scheduled_from.isoformat()}, {scheduled_to.isoformat()}) 内",
+                details={
+                    "work_order_no": work_order_no,
+                    "cert_no": cert_no,
+                    "calibrated_at": calibrated_at.isoformat(),
+                    "scheduled_from": scheduled_from.isoformat(),
+                    "scheduled_to": scheduled_to.isoformat(),
+                },
+            )
+        if cert["status"] != "ACTIVE":
+            raise ApiError(
+                422,
+                "settlement_cert_not_active",
+                f"证书 {cert_no} 当前状态为 {cert['status']}："
+                "仅生效中（ACTIVE）的普通证书可结清工单",
+                details={"work_order_no": work_order_no, "cert_no": cert_no, "status": cert["status"]},
+            )
+        if cert["conclusion"] != "PASS":
+            raise ApiError(
+                422,
+                "settlement_cert_not_passed",
+                f"证书 {cert_no} 校准结论为 {cert['conclusion']}："
+                "仅结论合格（PASS）的普通证书可结清工单",
+                details={
+                    "work_order_no": work_order_no,
+                    "cert_no": cert_no,
+                    "conclusion": cert["conclusion"],
+                },
+            )
+
+        # 部分唯一索引保证“一张证书至多结清一个工单”：并发下若该证书已被
+        # 其他工单抢先绑定，UPDATE 在保存点子事务内抛唯一冲突，回滚保存点
+        # （外层事务与工单行锁仍有效）后读取持有工单并返回明确冲突。
+        holder_no = None
+        try:
+            with conn.transaction():
+                conn.execute(
+                    """
+                    UPDATE calibration_work_orders
+                    SET status = 'SETTLED', cert_no = %s, settled_at = %s
+                    WHERE work_order_no = %s AND status = 'PENDING'
+                    """,
+                    (cert_no, now, work_order_no),
+                )
+        except psycopg.errors.UniqueViolation:
+            holder = conn.execute(
+                "SELECT work_order_no FROM calibration_work_orders "
+                "WHERE cert_no = %s AND status = 'SETTLED'",
+                (cert_no,),
+            ).fetchone()
+            holder_no = holder["work_order_no"] if holder else None
+        if holder_no is not None:
+            raise ApiError(
+                409,
+                "settlement_cert_already_settled",
+                f"证书 {cert_no} 已用于结清工单 {holder_no}："
+                "一张证书不得结清两个工单",
+                details={
+                    "work_order_no": work_order_no,
+                    "cert_no": cert_no,
+                    "bound_work_order_no": holder_no,
+                },
+            )
+        row = _get_work_order_row(conn, work_order_no)
+        return _work_order_view(conn, row), True
+
+
+def settle_work_order(conn, work_order_no: str, req, management_key: str | None) -> tuple[dict, bool]:
+    """结清工单：绑定一张已签发的合格普通证书与结清时刻，返回 (视图, 是否首次结清)。
+
+    - 管理密钥缺失/错误 401 invalid_management_key；
+    - 工单不存在 404 work_order_not_found；证书不存在 404 cert_not_found；
+    - 非普通证书 422 settlement_cert_not_calibration；设备标识不一致
+      422 settlement_device_mismatch；校准时刻不在计划半开区间
+      422 settlement_outside_schedule；证书非 ACTIVE
+      422 settlement_cert_not_active；结论非 PASS 422 settlement_cert_not_passed；
+    - 同工单改绑其他证书 409 work_order_cert_rebind_conflict；已取消工单结清
+      409 work_order_not_pending；证书已结清其他工单（含并发）
+      409 settlement_cert_already_settled（一张证书不得结清两个工单）；
+    - 同工单同证书重试返回首次结果（200，绑定证书事后撤销/失效亦原样返回）；
+    - 并发结清/取消由工单行 FOR UPDATE 串行化；并发撤销由证书行锁按提交
+      次序串行（撤销先提交则本次按非 ACTIVE 拒绝，工单保持 PENDING）；
+      理论等待环由死锁检测终止后整体重试，耗尽 409 work_order_busy。
+    """
+    _require_management_key(management_key)
+    cert_no = req.cert_no
+    for attempt in range(3):
+        try:
+            return _settle_work_order_once(
+                conn, work_order_no, cert_no, datetime.now(timezone.utc)
+            )
+        except ApiError:
+            raise
+        except psycopg.errors.DeadlockDetected:
+            if attempt == 2:
+                raise ApiError(
+                    409,
+                    "work_order_busy",
+                    f"工单 {work_order_no} 的结清与并发取消/撤销竞争，重试后仍冲突，"
+                    "工单保持待完成，请稍后重试",
+                    details={"work_order_no": work_order_no, "cert_no": cert_no},
+                )
+    raise ApiError(409, "work_order_busy", "工单结清失败，请稍后重试")
+
+
+def cancel_work_order(conn, work_order_no: str, management_key: str | None) -> dict:
+    """取消待完成工单（仅 PENDING 可取消），返回工单视图。
+
+    管理密钥缺失/错误 401；工单不存在 404 work_order_not_found；
+    已结清/已取消工单再取消 409 work_order_not_pending（details 给出当前
+    状态；结清工单只能查询、不可取消或改绑）。并发结清/取消由工单行
+    FOR UPDATE 串行化：先到者胜，后到者按已推进状态报冲突。
+    """
+    _require_management_key(management_key)
+    with conn.transaction():
+        row = _get_work_order_row(conn, work_order_no, lock=True)
+        if row is None:
+            raise ApiError(404, "work_order_not_found", f"工单不存在: {work_order_no}")
+        if row["status"] != "PENDING":
+            raise ApiError(
+                409,
+                "work_order_not_pending",
+                f"工单 {work_order_no} 当前状态为 {row['status']}："
+                "只有待完成（PENDING）工单可取消（已结清不得取消或改绑）",
+                details={"work_order_no": work_order_no, "status": row["status"]},
+            )
+        now = datetime.now(timezone.utc)
+        conn.execute(
+            """
+            UPDATE calibration_work_orders
+            SET status = 'CANCELLED', cancelled_at = %s
+            WHERE work_order_no = %s AND status = 'PENDING'
+            """,
+            (now, work_order_no),
+        )
+        row = _get_work_order_row(conn, work_order_no)
+        return _work_order_view(conn, row)
+
+
+def get_work_order(conn, work_order_no: str, management_key: str | None) -> dict:
+    """按工单号查询：登记信息、状态，以及绑定证书的当前内容（含当前状态）。
+
+    管理密钥缺失/错误 401；工单不存在 404 work_order_not_found。
+    PENDING 不携带证书；SETTLED 嵌入绑定证书的【当前】内容——证书日后
+    撤销（REVOKED）或失效（INVALID）只在 certificate.status 实时反映，
+    不倒退工单状态、不改写 settled_at 与绑定编号；CANCELLED 不携带证书。
+    """
+    _require_management_key(management_key)
+    row = _get_work_order_row(conn, work_order_no)
+    if row is None:
+        raise ApiError(404, "work_order_not_found", f"工单不存在: {work_order_no}")
+    return _work_order_view(conn, row)

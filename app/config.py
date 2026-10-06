@@ -44,8 +44,9 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 8080
 
-    # 交付方管理密钥：创建签收邀请、查询定稿记录时凭 X-Management-Key 头校验。
-    # 仅本地配置、不落库；生产部署必须通过环境变量覆盖默认值。
+    # 交付方管理密钥：创建签收邀请、查询定稿记录、标准证书临时停用、
+    # 每日校准使用量上限配置，以及设备校准委托工单的登记/取消/结清/查询
+    # 时凭 X-Management-Key 头校验。仅本地配置、不落库；生产部署必须覆盖默认值。
     delivery_management_key: str = "caltrace-delivery-admin"
 
     # 普通证书“双人复核签发”的本地身份凭据表（仅本地配置、不落库）：

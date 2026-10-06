@@ -5,6 +5,10 @@
 - POST   /api/v1/certificates                  签发普通校准证书
 - PUT    /api/v1/certificates/{cert_no}/daily-quotas/{day}  设定/调整标准证书×UTC日期每日校准使用量上限（管理密钥，非负；首次201/调整200）
 - GET    /api/v1/certificates/{cert_no}/daily-quotas/{day}  查询上限与实时已用次数（管理密钥；未配置 404）
+- POST   /api/v1/work-orders                 登记设备校准委托工单（管理密钥，工单号幂等）
+- POST   /api/v1/work-orders/{work_order_no}/settle    结清工单（管理密钥，绑定已签发合格普通证书；首次201/同证重试200）
+- POST   /api/v1/work-orders/{work_order_no}/cancel    取消待完成工单（管理密钥，仅 PENDING 可取消）
+- GET    /api/v1/work-orders/{work_order_no}           按工单号查询（管理密钥，返回绑定证书当前状态）
 - POST   /api/v1/certificate-review-requests   录入人提交普通证书签发复核申请（X-Entry-Key，申请号幂等）
 - POST   /api/v1/certificate-review-requests/{application_no}/decision  复核人驳回/批准（X-Reviewer-Key，批准同事务真正签发）
 - GET    /api/v1/certificate-review-requests/{application_no}  按申请号查询状态与结果（录入/复核凭据）
@@ -60,6 +64,9 @@ from .schemas import (
     DeliveryRevocationNoticeOut,
     ReferenceIssueRequest,
     RevokeRequest,
+    WorkOrderOut,
+    WorkOrderRegisterRequest,
+    WorkOrderSettleRequest,
 )
 
 router = APIRouter(prefix="/api/v1")
@@ -515,3 +522,98 @@ def get_revocation_archive_impact(
     （含级联失效）的归档包及包内目标证书，按 (归档包编号, 原交付序位) 分页。"""
     with pool.connection() as conn:
         return repo.get_revocation_archive_impact(conn, batch_id, limit, offset)
+
+
+# ---------------------------------------------------------------------------
+# 设备校准委托工单
+# ---------------------------------------------------------------------------
+
+@router.post("/work-orders", status_code=201, response_model=WorkOrderOut)
+def register_work_order(
+    req: WorkOrderRegisterRequest,
+    response: Response,
+    x_management_key: str | None = Header(
+        default=None,
+        alias="X-Management-Key",
+        description="本地配置的管理密钥（与交付/停用/限额管理共用）",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """登记设备校准委托工单：唯一工单号 + 设备标识 + 委托人 + 带时区计划校准
+    时段（半开区间 [scheduled_from, scheduled_to)）。
+
+    登记只保存委托信息，不预占证书编号、有效期或每日限额，初始为 PENDING。
+    工单号幂等：同号同内容重试返回原工单（200），同号异内容
+    409 work_order_conflict；管理密钥缺失/错误 401。
+    """
+    with pool.connection() as conn:
+        body, created = repo.register_work_order(conn, req, x_management_key)
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.post("/work-orders/{work_order_no}/settle", status_code=201, response_model=WorkOrderOut)
+def settle_work_order(
+    work_order_no: str,
+    req: WorkOrderSettleRequest,
+    response: Response,
+    x_management_key: str | None = Header(
+        default=None,
+        alias="X-Management-Key",
+        description="本地配置的管理密钥（与交付/停用/限额管理共用）",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """结清工单并固定绑定一张已签发普通校准证书。
+
+    仅接受：设备标识与工单一致、校准时刻落在计划半开区间内、当前 ACTIVE 且
+    结论 PASS 的普通（CALIBRATION）证书；一张证书不得结清两个工单。首次结清
+    201；同工单同证书重试返回首次结果（200，即使证书事后撤销/失效）；改绑
+    其他证书 409 work_order_cert_rebind_conflict、已取消工单结清
+    409 work_order_not_pending、证书已结清其他工单
+    409 settlement_cert_already_settled。结清后不可取消。
+    """
+    with pool.connection() as conn:
+        body, created = repo.settle_work_order(conn, work_order_no, req, x_management_key)
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.post("/work-orders/{work_order_no}/cancel", status_code=200, response_model=WorkOrderOut)
+def cancel_work_order(
+    work_order_no: str,
+    x_management_key: str | None = Header(
+        default=None,
+        alias="X-Management-Key",
+        description="本地配置的管理密钥（与交付/停用/限额管理共用）",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """取消待完成工单：只有 PENDING 工单可取消；已结清不得取消或改绑，
+    已取消/已结清再取消 409 work_order_not_pending。管理密钥缺失/错误 401，
+    工单未知 404 work_order_not_found。并发结清/取消按提交次序仅一方生效。
+    """
+    with pool.connection() as conn:
+        return repo.cancel_work_order(conn, work_order_no, x_management_key)
+
+
+@router.get("/work-orders/{work_order_no}", response_model=WorkOrderOut)
+def get_work_order(
+    work_order_no: str,
+    x_management_key: str | None = Header(
+        default=None,
+        alias="X-Management-Key",
+        description="本地配置的管理密钥（与交付/停用/限额管理共用）",
+    ),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """按工单号查询登记信息与状态；已结清时返回绑定证书的【当前】内容
+    （certificate.status 实时反映 ACTIVE/REVOKED/INVALID）——证书日后撤销或
+    失效不倒退工单状态、不改写结清时刻与绑定编号。
+
+    管理密钥缺失/错误 401；工单未知 404 work_order_not_found。
+    """
+    with pool.connection() as conn:
+        return repo.get_work_order(conn, work_order_no, x_management_key)

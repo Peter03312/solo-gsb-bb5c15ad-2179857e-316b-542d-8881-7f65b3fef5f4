@@ -37,6 +37,14 @@ UTC 日期及**直接引用**的上游证书在真正签发时计一次，未配
 同一事务原子扣额，超限拒绝本次签发并指出上游证书与日期，批次整批不落库、
 复核申请保持待审；并发调整与签发按提交次序串行绝不超额，既有批次幂等重放
 只返回首次结果、不重复计数。
+计量机构接收**设备校准委托工单**：管理员凭管理密钥登记唯一工单号、设备标识、
+委托人与带时区的计划校准半开区间（同号同内容重试返回原工单，同号异内容拒绝），
+工单初始待完成、仅可在该状态取消；结清时提交工单号与已签发证书编号，只接受
+设备标识一致、校准时刻落在计划时段内且当前 `ACTIVE`、`PASS` 的普通证书，一张
+证书不得结清两个工单；结清后绑定与结清时刻固定（同工单同证书重试返回原结果，
+改绑或取消报冲突），**不预占**证书编号、有效期或每日限额，既有单张、批次与
+双人复核签发规则照常；证书日后撤销或失效**不倒退**工单状态，查询工单返回绑定
+证书的当前状态。
 
 - 技术栈：Python 3.11 · FastAPI · PostgreSQL 16 · psycopg3
 - 关键业务不变量由**数据库约束 + 触发器 + 单事务**保证，不依赖应用层“先查后写”，
@@ -56,7 +64,7 @@ UTC 日期及**直接引用**的上游证书在真正签发时计一次，未配
 │   ├── db.py            # 连接池
 │   ├── config.py        # 环境变量配置
 │   └── errors.py        # 统一业务错误
-├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图、批次/更正/交付归档/签收/停用/复核申请/撤销风险告知/每日用量上限表）
+├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图、批次/更正/交付归档/签收/停用/复核申请/撤销风险告知/每日用量上限/委托工单表）
 ├── scripts/             # 冒烟测试脚本（可直接对运行中的服务执行）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -111,7 +119,7 @@ docker compose down -v       # 停止并删除数据卷（下次启动重新初�
 | `POSTGRES_DB` | `caltrace` | 数据库名 |
 | `POSTGRES_PORT` | `127.0.0.1:5432` | 数据库在宿主机的绑定地址:端口 |
 | `DB_HOST` / `DB_PORT` | `db` / `5432` | API 容器内连接数据库用（compose 已固定） |
-| `DELIVERY_MANAGEMENT_KEY` | `caltrace-delivery-admin` | 管理密钥：创建签收邀请、查询定稿记录，标准证书临时停用的登记/解除/查询，以及标准证书每日校准使用量上限的设定/调整/查询，均经 `X-Management-Key` 头校验；默认值仅供本机开发，生产必须覆盖为随机长密钥 |
+| `DELIVERY_MANAGEMENT_KEY` | `caltrace-delivery-admin` | 管理密钥：创建签收邀请、查询定稿记录，标准证书临时停用的登记/解除/查询，标准证书每日校准使用量上限的设定/调整/查询，以及设备校准委托工单的登记/取消/结清/查询，均经 `X-Management-Key` 头校验；默认值仅供本机开发，生产必须覆盖为随机长密钥 |
 | `CERTIFICATE_ENTRY_KEYS` | `entry-1=caltrace-entry-key` | 普通证书双人复核的**录入人凭据表**：逗号分隔，每项 `身份名=凭据`；提交申请经 `X-Entry-Key` 头校验。仅本地配置，默认值仅供本机开发 |
 | `CERTIFICATE_REVIEWER_KEYS` | `reviewer-1=caltrace-review-key-1,reviewer-2=caltrace-review-key-2` | 普通证书双人复核的**复核人凭据表**：格式同上；驳回/批准经 `X-Reviewer-Key` 头校验。复核凭据必须与该申请的录入凭据不同（同凭据复核 `403`）；默认值仅供本机开发 |
 
@@ -388,6 +396,60 @@ DB_HOST=127.0.0.1 DB_PORT=5432 DB_NAME=caltrace DB_USER=caltrace DB_PASSWORD=sec
       状态、追溯链、撤销/级联失效、停用、交付归档与覆盖审计；撤销或失效
       后上限配置依然存在并继续拦截新签发（此时引用会先按既有
       `reference_not_active` 规则被拒）。
+18. **设备校准委托工单（登记/取消/结清/查询，管理密钥）**：
+    - **登记**：管理员在 `X-Management-Key` 头中携带管理密钥（与交付/停用/
+      限额共用同一把 `DELIVERY_MANAGEMENT_KEY`），以**唯一工单号**登记
+      设备标识、委托人（非空白）与**带时区的计划校准时段**（半开区间
+      `[scheduled_from, scheduled_to)`，起点必须早于终点）。登记只保存
+      委托信息，**不预占**证书编号、设备有效期或每日限额——既有单张签发、
+      交接批次与双人复核签发规则完全照常。工单初始为 `PENDING`（待完成）。
+      工单号为幂等键：**同号同内容重试返回原工单**（HTTP 200），**同号
+      异内容**返回 `409 work_order_conflict`；并发同号由主键兜底，仅一份
+      首次登记（201），其余重放（200）。
+    - **取消**：`POST /api/v1/work-orders/{no}/cancel` 仅 `PENDING` 工单
+      可取消，取消后为 `CANCELLED` 并记录取消时刻；已结清、已取消工单再
+      取消（或已取消再结清）返回 `409 work_order_not_pending`。
+    - **结清**：`POST /api/v1/work-orders/{no}/settle` 提交工单号与**已
+      签发证书编号**。只接受同时满足下列条件的证书，任一不满足按对应错误
+      码拒绝且工单保持 `PENDING`：
+      * 普通校准证书（`kind=CALIBRATION`）——基准证书 `422
+        settlement_cert_not_calibration`；
+      * **设备标识与工单登记一致**——`422 settlement_device_mismatch`
+        （`details` 同时给出工单设备与证书设备）；
+      * **校准时刻 `calibrated_at` 落在计划半开区间内**
+        （`scheduled_from <= calibrated_at < scheduled_to`，时区按同一
+        时刻比较）——越界（含恰等于终点）`422 settlement_outside_schedule`；
+      * 证书**当前**为 `ACTIVE`——已撤销/失效 `422 settlement_cert_not_active`；
+      * 校准结论为 **PASS**——`422 settlement_cert_not_passed`；
+      * 证书不存在 `404 cert_not_found`、工单不存在 `404 work_order_not_found`。
+      **一张证书不得结清两个工单**：数据库在 `cert_no WHERE status='SETTLED'`
+      上的部分唯一索引兜底，并发结清同一张证书时仅一个事务成功，其余
+      `409 settlement_cert_already_settled`（`details.bound_work_order_no`
+      点名已持有的工单）。
+    - **绑定固定与重试**：结清成功后状态为 `SETTLED`，证书编号与**结清
+      时刻**一次性绑定、不可更改。**同工单同证书重试返回首次结清结果**
+      （HTTP 200，结清时刻逐字段等于首次值，即使证书事后已撤销/失效）；
+      对已结清工单提交**其他证书编号**返回
+      `409 work_order_cert_rebind_conflict`；已结清工单**不可取消**。
+    - **撤销/失效不倒退**：绑定仅记录结清当时满足条件；证书日后被
+      撤销（REVOKED）或因上游撤销级联失效（INVALID）**不回退工单状态、
+      不改写结清时刻与绑定编号**。查询工单返回的 `certificate` 为绑定
+      证书的**当前**内容（`certificate.status` 实时为
+      ACTIVE/REVOKED/INVALID）。
+    - **并发**：结清与取消在工单行 `FOR UPDATE` 上按**提交次序**串行——
+      先结清则取消报 `work_order_not_pending`，先取消则结清报
+      `work_order_not_pending`，绝无“已取消又结清”或“已结清又取消”；
+      结清事务在证书行锁内完成 ACTIVE/PASS/时段复核，与并发撤销按提交
+      次序串行（撤销先提交则本次结清按非 ACTIVE 拒绝、工单保持 PENDING，
+      无无效结清）；理论等待环由死锁检测终止后整体重试，耗尽
+      `409 work_order_busy`（调用方可重试）。
+    - **查询**：`GET /api/v1/work-orders/{no}` 凭管理密钥返回登记信息、
+      状态、取消/结清时刻，以及（已结清时）绑定证书的当前内容。缺/错
+      密钥 `401`，未知工单 `404 work_order_not_found`。
+    - **只增不改**：工单登记内容与状态由触发器保护，仅允许
+      `PENDING → SETTLED/CANCELLED` 一次性推进，禁止 DELETE 与任何字段
+      改写；工单不触碰 `certificates` 表，不影响证书内容、追溯链、撤销、
+      停用、交付归档、限额与覆盖审计。
 
 证书状态：`ACTIVE` 生效中 / `REVOKED` 被主动撤销 / `INVALID` 因上游撤销级联失效。
 
@@ -1346,6 +1408,118 @@ curl -sS -X POST http://localhost:8080/api/v1/delivery-revocation-notices/1/conf
 - 告知内容（批次、受影响目标、命中明细、生成时刻）只增不改，确认不改写
   归档快照、签收记录与撤销记录。
 
+### 27. 设备校准委托工单（登记/结清/取消/查询，X-Management-Key）
+
+计量机构接收设备校准委托后，用工单追踪最终证书。登记、取消、结清、查询均
+须在 `X-Management-Key` 头携带本地管理密钥（与交付/停用/限额共用）。
+
+**(1) 登记工单** —— 唯一工单号 + 设备标识 + 委托人 + 带时区计划校准半开区间
+`[scheduled_from, scheduled_to)`。登记不预占证书编号/有效期/每日限额，初始
+`PENDING`。同号同内容重试返回原工单（`200`），同号异内容
+`409 work_order_conflict`：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/work-orders \
+  -H 'Content-Type: application/json' \
+  -H 'X-Management-Key: caltrace-delivery-admin' \
+  -d '{
+    "work_order_no": "WO-2026-0001",
+    "device_id": "DEV-WS-A",
+    "client": "某精密制造有限公司",
+    "scheduled_from": "2026-06-01T09:00:00+08:00",
+    "scheduled_to":   "2026-06-03T18:00:00+08:00"
+  }' | python3 -m json.tool
+```
+
+首次 `201`、重试 `200`，响应：
+
+```json
+{
+  "work_order_no": "WO-2026-0001",
+  "status": "PENDING",
+  "device_id": "DEV-WS-A",
+  "client": "某精密制造有限公司",
+  "scheduled_from": "2026-06-01T01:00:00Z",
+  "scheduled_to": "2026-06-03T10:00:00Z",
+  "created_at": "2026-05-20T03:10:00Z",
+  "cert_no": null,
+  "settled_at": null,
+  "cancelled_at": null,
+  "certificate": null
+}
+```
+
+**(2) 结清工单** —— 提交已签发证书编号，仅接受设备一致、校准时刻落在计划
+半开区间内、当前 `ACTIVE` 且 `PASS` 的普通证书；一张证书不得结清两个工单。
+首次 `201`，**同工单同证书重试 `200`**（返回首次结果）：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/work-orders/WO-2026-0001/settle \
+  -H 'Content-Type: application/json' \
+  -H 'X-Management-Key: caltrace-delivery-admin' \
+  -d '{"cert_no": "CAL-WS-001"}' | python3 -m json.tool
+```
+
+```json
+{
+  "work_order_no": "WO-2026-0001",
+  "status": "SETTLED",
+  "device_id": "DEV-WS-A",
+  "client": "某精密制造有限公司",
+  "scheduled_from": "2026-06-01T01:00:00Z",
+  "scheduled_to": "2026-06-03T10:00:00Z",
+  "created_at": "2026-05-20T03:10:00Z",
+  "cert_no": "CAL-WS-001",
+  "settled_at": "2026-06-02T06:30:00Z",
+  "cancelled_at": null,
+  "certificate": {
+    "cert_no": "CAL-WS-001",
+    "kind": "CALIBRATION",
+    "device_id": "DEV-WS-A",
+    "calibrated_at": "2026-06-02T06:00:00Z",
+    "conclusion": "PASS",
+    "status": "ACTIVE"
+  }
+}
+```
+
+结清失败示例（设备标识不一致；其余资格错误码见“错误响应”表）：
+
+```json
+{
+  "error": {
+    "code": "settlement_device_mismatch",
+    "message": "证书 CAL-X 的设备标识 DEV-OTHER 与工单 WO-2026-0001 登记的设备标识 DEV-WS-A 不一致，不得用于结清",
+    "details": {
+      "work_order_no": "WO-2026-0001",
+      "cert_no": "CAL-X",
+      "work_order_device_id": "DEV-WS-A",
+      "cert_device_id": "DEV-OTHER"
+    }
+  }
+}
+```
+
+**(3) 取消待完成工单** —— 仅 `PENDING` 可取消；已结清不得取消或改绑：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/work-orders/WO-2026-0002/cancel \
+  -H 'X-Management-Key: caltrace-delivery-admin'
+```
+
+**(4) 查询工单** —— 返回登记信息、状态与（已结清时）绑定证书的**当前**内容；
+证书日后撤销/失效只在 `certificate.status` 实时反映，不倒退工单状态：
+
+```bash
+curl -sS http://localhost:8080/api/v1/work-orders/WO-2026-0001 \
+  -H 'X-Management-Key: caltrace-delivery-admin' | python3 -m json.tool
+```
+
+要点：登记/取消/结清/查询缺/错密钥一律 `401 invalid_management_key`；
+未知工单 `404 work_order_not_found`；结清后证书被撤销，工单仍 `SETTLED`，
+查询中 `certificate.status` 变为 `REVOKED`（或上游撤销导致的 `INVALID`），
+`settled_at` 与 `cert_no` 保持首次绑定值。
+
 ---
 
 ## 错误响应
@@ -1402,6 +1576,18 @@ curl -sS -X POST http://localhost:8080/api/v1/delivery-revocation-notices/1/conf
 | 422 | `validity_overlap` | 同设备已生效证书有效期重叠（含批内重叠） |
 | 409 | `validity_overlap_concurrent` | 并发签发重叠，排他约束兜底拒绝 |
 | 422 | `invalid_audit_window` | 覆盖审计起止无效：缺时区/起点不早于终点/终点晚于查询时刻 |
+| 401 | `invalid_management_key` | 登记/取消/结清/查询委托工单时 `X-Management-Key` 缺失/错误（与交付/停用/限额共用同一把密钥） |
+| 404 | `work_order_not_found` | 取消/结清/查询时工单不存在 |
+| 409 | `work_order_conflict` | 同一工单号登记了内容不同的委托工单（同号异内容） |
+| 409 | `work_order_not_pending` | 对非待完成工单操作：已结清工单再取消/改绑、已取消工单再取消或结清（`details.status` 给出当前状态） |
+| 409 | `work_order_cert_rebind_conflict` | 已结清工单提交了另一张证书编号（绑定固定不可改绑；同工单同证书重试返回首次结果） |
+| 409 | `settlement_cert_already_settled` | 证书已用于结清另一工单（含并发），一张证书不得结清两个工单（`details.bound_work_order_no` 点名持有工单） |
+| 422 | `settlement_cert_not_calibration` | 用基准证书（REFERENCE）结清工单：仅接受普通校准证书 |
+| 422 | `settlement_device_mismatch` | 证书设备标识与工单登记的设备标识不一致（`details` 给出两侧设备标识） |
+| 422 | `settlement_outside_schedule` | 证书校准时刻不在工单计划半开区间 `[scheduled_from, scheduled_to)` 内（恰等于终点也算越界） |
+| 422 | `settlement_cert_not_active` | 证书当前非 ACTIVE（已撤销/失效），不得结清工单 |
+| 422 | `settlement_cert_not_passed` | 证书校准结论非 PASS（FAIL），不得结清工单 |
+| 409 | `work_order_busy` | 工单结清与并发取消/撤销竞争且死锁重试耗尽（工单保持待完成，调用方可重试） |
 
 > 批次签发中由单条记录触发的校验错误与单张签发同码，并在 `details.cert_no`
 > 中给出出错证书编号（必要时附 `details.parent_cert_no` / `details.cycle` 等）。
@@ -1425,6 +1611,7 @@ python3 scripts/suspension_checks.py  # 标准证书临时停用：登记/解除
 python3 scripts/review_checks.py      # 普通证书双人复核：凭据/待审不占用/驳回不可再批准/批准按当时规则真正签发/失败仍待审/幂等与并发定稿/契约不变
 python3 scripts/notice_checks.py      # 撤销风险告知：ACCEPT 归档波及生成/同包同批一份/未签收与 REJECT 不生成/查询确认凭据/过期确认/并发次序
 python3 scripts/quota_checks.py       # 标准证书每日用量上限：设定调整/下限保护/UTC 切日/单张批次合并计数整批不落库/复核待审/撤销不退/幂等不重复计数/并发不超额
+python3 scripts/workorder_checks.py   # 设备校准委托工单：登记幂等冲突/取消仅待完成/结清五条件与一证一单/绑定固定/撤销不倒退/并发结清取消撤销
 ```
 
 覆盖：基准登记、多级签发、无效引用、越界校准时刻、区间重叠（含首尾相接）、
@@ -1522,3 +1709,18 @@ REJECTED 绑定结论/复核人/原因/时刻且不产生证书、驳回后再�
 竞争保护不影响该不变量）、并发“下调为 0 × 签发”按提交次序串行
 （成功签发数恰等于下调时已用数，下调后到达的签发无额外成功），以及根
 索引端点清单包含新接口、既有签发/批次/复核接口契约不变。
+设备校准委托工单的管理密钥校验（缺失/错误 401）、计划半开区间校验
+（倒区间/零长度/空白字段 422）、登记幂等（同号同内容 200、同号异内容
+409、8 路并发同号 1×201 其余 200）、查询（未知工单 404、缺密钥 401）、
+取消（仅 PENDING 可取消，结清/取消后再操作 409）、结清五条件分别命中
+（基准证书/设备不一致/校准时刻早于起点与恰等于终点/FAIL/不存在，且全部
+失败后工单仍 PENDING）、半开起点（含）可结清、成功结清 201 且返回绑定
+证书当前内容、同工单同证书重试 200 且 `settled_at` 不变、改绑其他证书
+409、结清后取消 409、一证结清第二工单 409 且点名持有工单、第二张证书可
+结清另一工单；结清后撤销绑定证书工单仍 SETTLED 且证书状态实时为
+REVOKED、撤销后同证重试仍返回首次结果、撤销证书结清新单 422、上游撤销
+级联 INVALID 不倒退已结清工单且新单结清 422；并发结清×取消 6 组按提交
+次序恰一方生效（无“已取消又结清/已结清又取消”）、两工单与 8 工单并发
+同证书结清恰 1×201 其余 409（无重复绑定）；登记工单不预占（证书随后正常
+签发与结清），以及根索引端点清单包含 4 个工单接口、健康检查与既有证书
+查询契约不变（共 55 项）。

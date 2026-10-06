@@ -300,6 +300,53 @@ CREATE INDEX idx_cert_quota_usage
     ON certificates (parent_cert_no, ((calibrated_at AT TIME ZONE 'UTC')::date));
 
 -- ----------------------------------------------------------------------------
+-- 设备校准委托工单表：计量机构接收设备校准委托后，用以追踪最终签发的校准
+-- 证书。管理员凭本地管理密钥登记：唯一工单号、设备标识、委托人、带时区的
+-- 计划校准时段（半开区间 [scheduled_from, scheduled_to)）。登记只保存委托
+-- 信息，不预占证书编号、有效期或每日限额；初始状态 PENDING（待完成）。
+--   PENDING  -> SETTLED   结清：绑定一张已签发的普通校准证书与结清时刻；
+--   PENDING  -> CANCELLED 取消：仅 PENDING 可取消。
+-- 结清只接受：设备标识一致、校准时刻落在计划半开区间内、当前 ACTIVE 且
+-- 结论 PASS 的普通（CALIBRATION）证书；部分唯一索引保证一张证书至多结清
+-- 一个工单（并发结清由数据库兜底，胜者唯一）。绑定一经结清固定：同工单
+-- 同证书重试返回首次结果，改绑其他证书或取消报冲突。证书日后撤销/失效
+-- 不倒退工单状态（查询时实时读取证书当前状态）。
+-- work_order_no 为业务幂等键：request_hash 为规范化登记请求指纹，同号同
+-- 内容重放原工单，同号异内容判冲突。本表只增不改（触发器强制一次性状态
+-- 推进，禁止 DELETE）。
+-- ----------------------------------------------------------------------------
+CREATE TABLE calibration_work_orders (
+    work_order_no  TEXT PRIMARY KEY,             -- 工单号（业务唯一，幂等键）
+    device_id      TEXT NOT NULL,                -- 委托设备标识（须与结清证书一致）
+    client         TEXT NOT NULL,                -- 委托人
+    scheduled_from TIMESTAMPTZ NOT NULL,         -- 计划校准时段起点（含）
+    scheduled_to   TIMESTAMPTZ NOT NULL,         -- 计划校准时段终点（不含）
+    request_hash   TEXT NOT NULL,                -- 规范化登记请求的 SHA-256 指纹
+    status         TEXT NOT NULL DEFAULT 'PENDING'
+                     CHECK (status IN ('PENDING', 'SETTLED', 'CANCELLED')),
+    cert_no        TEXT REFERENCES certificates(cert_no), -- 结清绑定的证书编号
+    settled_at     TIMESTAMPTZ,                  -- 结清时刻（固定，不随后续撤销改写）
+    cancelled_at   TIMESTAMPTZ,                  -- 取消时刻
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT work_order_window_order CHECK (scheduled_from < scheduled_to),
+    CONSTRAINT work_order_status_metadata
+        CHECK (
+            (status = 'PENDING'
+                 AND cert_no IS NULL AND settled_at IS NULL AND cancelled_at IS NULL)
+            OR (status = 'SETTLED'
+                 AND cert_no IS NOT NULL AND settled_at IS NOT NULL AND cancelled_at IS NULL)
+            OR (status = 'CANCELLED'
+                 AND cert_no IS NULL AND settled_at IS NULL AND cancelled_at IS NOT NULL)
+        )
+);
+CREATE INDEX idx_work_orders_device ON calibration_work_orders(device_id);
+
+-- 一张证书至多结清一个工单：仅 SETTLED 行的 cert_no 受唯一约束，
+-- 并发结清同一张证书时由数据库兜底，仅一个事务能绑定成功。
+CREATE UNIQUE INDEX idx_work_orders_one_per_cert
+    ON calibration_work_orders(cert_no) WHERE (status = 'SETTLED');
+
+-- ----------------------------------------------------------------------------
 -- 触发器 1：证书签发内容不可改写
 -- 仅允许 status / revoked_reason / revoked_at 在撤销事务中变化；
 -- 其余业务字段（编号、设备、时间、结论、引用关系等）一律拒绝 UPDATE。
@@ -478,6 +525,37 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER trg_cert_review_decide_once
     BEFORE UPDATE OR DELETE ON certificate_review_requests
     FOR EACH ROW EXECUTE FUNCTION cert_review_decide_once();
+
+-- 工单仅允许“PENDING -> SETTLED/CANCELLED”这一次性状态推进 UPDATE：
+-- 登记内容（工单号/设备/委托人/计划时段/请求指纹）不可改；已结清不得改绑
+-- 或取消，已取消不得结清；结清绑定的证书编号与结清时刻、取消时刻一次性
+-- 写入不可改；DELETE 禁止。
+CREATE OR REPLACE FUNCTION work_order_transition_once() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'calibration_work_orders is append-only: %', OLD.work_order_no
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF OLD.status <> 'PENDING' OR NEW.status NOT IN ('SETTLED', 'CANCELLED')
+       OR NEW.work_order_no  IS DISTINCT FROM OLD.work_order_no
+       OR NEW.device_id      IS DISTINCT FROM OLD.device_id
+       OR NEW.client         IS DISTINCT FROM OLD.client
+       OR NEW.scheduled_from IS DISTINCT FROM OLD.scheduled_from
+       OR NEW.scheduled_to   IS DISTINCT FROM OLD.scheduled_to
+       OR NEW.request_hash   IS DISTINCT FROM OLD.request_hash
+       OR NEW.created_at     IS DISTINCT FROM OLD.created_at
+    THEN
+        RAISE EXCEPTION 'work order % can only transition once (% -> %)',
+            OLD.work_order_no, OLD.status, NEW.status
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_work_order_transition_once
+    BEFORE UPDATE OR DELETE ON calibration_work_orders
+    FOR EACH ROW EXECUTE FUNCTION work_order_transition_once();
 
 -- ----------------------------------------------------------------------------
 -- 查询视图：统一将枚举以文本形式暴露给应用层
